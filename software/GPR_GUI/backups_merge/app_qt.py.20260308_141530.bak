@@ -1,0 +1,1452 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GPR GUI (PyQt6 + themed)
+- Load CSV
+- Display B-扫 (matplotlib)
+- Select processing method (original + researched)
+- Configure method parameters
+- 撤销/重置 history
+- Display downsample + colorbar/grid toggles
+- Batch compare + report (with settings + log)
+"""
+import os
+import sys
+import re
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+
+from scipy.linalg import svd
+from scipy.ndimage import uniform_filter1d
+from scipy.fft import fft2, ifft2, fftshift, ifftshift
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QFormLayout,
+    QGroupBox,
+    QScrollArea,
+    QSplitter,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QComboBox,
+    QListWidget,
+    QListWidgetItem,
+    QTextEdit,
+    QCheckBox,
+    QFileDialog,
+    QMessageBox,
+)
+
+# add core module path
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CORE_DIR_CANDIDATES = [
+    os.path.abspath(os.path.join(BASE_DIR, "..", "PythonModule_core")),
+    os.path.abspath(os.path.join(BASE_DIR, "..", "..", "repos", "PythonModule_core")),
+]
+for _p in CORE_DIR_CANDIDATES:
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# ensure local dir (for read_file_data.py)
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+# read_file_data fallback
+_read_file_candidates = [
+    BASE_DIR,
+    os.path.abspath(os.path.join(BASE_DIR, "..", "..", "repos", "GPR_GUI")),
+    os.path.abspath(os.path.join(BASE_DIR, "..", "..", "repos", "PythonModule")),
+]
+for _p in _read_file_candidates:
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from read_file_data import savecsv, save_image
+
+
+# ------------------ CSV header parsing ------------------
+_HEADER_KEYS = [
+    "Number of Samples",
+    "Time windows (ns)",
+    "Number of Traces",
+    "Trace interval (m)",
+]
+
+
+def _parse_header_lines(lines):
+    if len(lines) < 4:
+        return None
+    info = {}
+    for line in lines[:4]:
+        if "=" not in line:
+            return None
+        left, right = line.split("=", 1)
+        key = left.strip()
+        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", right)
+        if not m:
+            return None
+        try:
+            val = float(m.group(0))
+        except Value错误:
+            return None
+        info[key] = val
+    if not all(k in info for k in _HEADER_KEYS):
+        return None
+    return {
+        "a_scan_length": int(info["Number of Samples"]),
+        "total_time_ns": float(info["Time windows (ns)"]),
+        "num_traces": int(info["Number of Traces"]),
+        "trace_interval_m": float(info["Trace interval (m)"]),
+    }
+
+
+def detect_csv_header(path: str):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [f.readline().strip() for _ in range(4)]
+    except OS错误:
+        return None
+    return _parse_header_lines(lines)
+
+
+def _is_numeric_row(line: str) -> bool:
+    parts = [p.strip() for p in line.split(",")]
+    has_num = False
+    for p in parts:
+        if p == "":
+            continue
+        try:
+            float(p)
+            has_num = True
+        except Value错误:
+            return False
+    return has_num
+
+
+def _detect_skiprows(path: str, max_lines: int = 10) -> int:
+    skip = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for _ in range(max_lines):
+                line = f.readline()
+                if not line:
+                    break
+                if _is_numeric_row(line.strip()):
+                    break
+                skip += 1
+    except OS错误:
+        return 0
+    return skip
+
+
+def _select_amp_column(raw_data: np.ndarray) -> int:
+    # Prefer column D (index=3) for 5-column CSVs used by UAV-GPR
+    if raw_data.shape[1] > 3:
+        return 3
+    return raw_data.shape[1] - 1
+
+
+# ------------------ Research methods ------------------
+
+def method_svd_background(data, rank=1, **kwargs):
+    U, S, Vt = svd(data, full_matrices=False)
+    S_bg = np.zeros_like(S)
+    S_bg[:rank] = S[:rank]
+    background = (U * S_bg) @ Vt
+    return data - background, background
+
+
+def method_fk_filter(data, angle_low=10, angle_high=65, taper_width=5, **kwargs):
+    F = fftshift(fft2(data))
+    ny, nx = F.shape
+
+    ky = fftshift(np.fft.fftfreq(ny))
+    kx = fftshift(np.fft.fftfreq(nx))
+
+    KY, KX = np.meshgrid(ky, kx, indexing='ij')
+    angle = np.degrees(np.arctan2(np.abs(KY), np.abs(KX)))
+
+    band_mask = (angle >= angle_low) & (angle <= angle_high)
+    mask = np.ones_like(angle, dtype=float)
+
+    if taper_width > 0:
+        sigma = taper_width
+        dist_to_low = np.abs(angle - angle_low)
+        dist_to_high = np.abs(angle - angle_high)
+        dist = np.minimum(dist_to_low, dist_to_high)
+
+        mask[band_mask] = 0.05
+        taper_region = band_mask & (dist < taper_width)
+        if np.any(taper_region):
+            mask[taper_region] = 1 - np.exp(-(dist[taper_region] ** 2) / (2 * sigma ** 2))
+    else:
+        mask[band_mask] = 0.0
+
+    F_filtered = F * mask
+    result = np.real(ifft2(ifftshift(F_filtered)))
+    return result, mask
+
+
+def method_hankel_svd(data, window_length=None, rank=None, **kwargs):
+    ny, nx = data.shape
+    if window_length is None or window_length <= 0:
+        window_length = ny // 4
+    window_length = min(window_length, ny - 1)
+
+    result = np.zeros_like(data)
+    for col in range(nx):
+        trace = data[:, col]
+        m = ny - window_length + 1
+        if m <= 0:
+            result[:, col] = trace
+            continue
+
+        hankel = np.zeros((m, window_length))
+        for i in range(window_length):
+            hankel[:, i] = trace[i:i + m]
+
+        U, S, Vt = svd(hankel, full_matrices=False)
+
+        if rank is None or rank <= 0:
+            diff_spec = np.diff(S)
+            threshold = np.mean(np.abs(diff_spec))
+            rank_val = 1
+            for i in range(len(diff_spec) - 2):
+                if (abs(diff_spec[i]) < threshold and
+                        abs(diff_spec[i + 1]) < threshold):
+                    rank_val = i + 1
+                    break
+            rank_val = max(rank_val, 1)
+        else:
+            rank_val = max(rank, 1)
+
+        S_filtered = np.zeros_like(S)
+        S_filtered[:rank_val] = S[:rank_val]
+        hankel_filtered = (U * S_filtered) @ Vt
+
+        trace_filtered = np.zeros(ny)
+        counts = np.zeros(ny)
+
+        for i in range(m):
+            for j in range(window_length):
+                trace_filtered[i + j] += hankel_filtered[i, j]
+                counts[i + j] += 1
+
+        trace_filtered /= counts
+        result[:, col] = trace_filtered
+
+    return result, None
+
+
+def method_sliding_average(data, window_size=10, axis=1, **kwargs):
+    background = uniform_filter1d(data, size=window_size, axis=axis, mode='nearest')
+    return data - background, background
+
+
+# ------------------ Method registry ------------------
+PROCESSING_METHODS = {
+    "compensatingGain": {
+        "name": "0 compensatingGain (manual gain compensation)",
+        "type": "core",
+        "module": "compensatingGain",
+        "func": "compensatingGain",
+        "params": [
+            {"name": "gain_min", "label": "Gain min", "type": "float", "default": 1.0, "min": 0.1, "max": 20.0},
+            {"name": "gain_max", "label": "Gain max", "type": "float", "default": 6.0, "min": 0.1, "max": 50.0},
+        ],
+    },
+    "dewow": {
+        "name": "1 dewow (low-frequency drift correction)",
+        "type": "core",
+        "module": "dewow",
+        "func": "dewow",
+        "params": [
+            {"name": "window", "label": "Window (samples)", "type": "int", "default": 31, "min": 1, "max": 1000},
+        ],
+    },
+    "set_zero_time": {
+        "name": "2 set_zero_time (zero-time correction)",
+        "type": "core",
+        "module": "set_zero_time",
+        "func": "set_zero_time",
+        "params": [
+            {"name": "new_zero_time", "label": "Zero-time (ns)", "type": "float", "default": 5.0, "min": 0.0, "max": 1000.0},
+        ],
+    },
+    "agcGain": {
+        "name": "3 agcGain (AGC correction)",
+        "type": "core",
+        "module": "agcGain",
+        "func": "agcGain",
+        "params": [
+            {"name": "window", "label": "Window (samples)", "type": "int", "default": 31, "min": 1, "max": 1000},
+        ],
+    },
+    "subtracting_average_2D": {
+        "name": "4 subtracting_average_2D (background removal)",
+        "type": "core",
+        "module": "subtracting_average_2D",
+        "func": "subtracting_average_2D",
+        "params": [],
+    },
+    "running_average_2D": {
+        "name": "5 running_average_2D (spike clutter suppression)",
+        "type": "core",
+        "module": "running_average_2D",
+        "func": "running_average_2D",
+        "params": [],
+    },
+    "svd_bg": {
+        "name": "SVD background removal (low-rank)",
+        "type": "local",
+        "func": method_svd_background,
+        "params": [
+            {"name": "rank", "label": "Rank (remove top r)", "type": "int", "default": 1, "min": 1, "max": 20},
+        ],
+    },
+    "fk_filter": {
+        "name": "F-K cone filter",
+        "type": "local",
+        "func": method_fk_filter,
+        "params": [
+            {"name": "angle_low", "label": "Stopband start angle (°)", "type": "int", "default": 10, "min": 0, "max": 90},
+            {"name": "angle_high", "label": "Stopband end angle (°)", "type": "int", "default": 65, "min": 0, "max": 90},
+            {"name": "taper_width", "label": "Taper width (°)", "type": "int", "default": 5, "min": 0, "max": 20},
+        ],
+    },
+    "hankel_svd": {
+        "name": "Hankel SVD denoising",
+        "type": "local",
+        "func": method_hankel_svd,
+        "params": [
+            {"name": "window_length", "label": "Window length (0=auto)", "type": "int", "default": 0, "min": 0, "max": 2000},
+            {"name": "rank", "label": "Rank kept (0=auto)", "type": "int", "default": 0, "min": 0, "max": 100},
+        ],
+    },
+    "sliding_avg": {
+        "name": "Sliding-average background removal",
+        "type": "local",
+        "func": method_sliding_average,
+        "params": [
+            {"name": "window_size", "label": "Window size", "type": "int", "default": 10, "min": 1, "max": 200},
+            {"name": "axis", "label": "Axis (0/1)", "type": "int", "default": 1, "min": 0, "max": 1},
+        ],
+    },
+}
+
+
+class GPRGuiQt(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("GPR 图像处理 - PyQt")
+        self.resize(1280, 800)
+        self._apply_style()
+
+        self.data = None
+        self.data_path = None
+        self.header_info = None
+        self.original_data = None
+        self.history = []
+        self.cbar = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root_layout.addWidget(splitter)
+
+        # Left panel (scrollable)
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(320)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(10)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(left_panel)
+        splitter.addWidget(scroll)
+
+        # Right panel (plot)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(6, 6, 6, 6)
+        splitter.addWidget(right_panel)
+
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 900])
+
+        # ----- Actions -----
+        action_box = QGroupBox("🧰 操作")
+        action_layout = QVBoxLayout(action_box)
+        self.btn_import = QPushButton("导入 CSV")
+        self.btn_import.setProperty("class", "primary")
+        self.btn_apply = QPushButton("应用所选方法")
+        self.btn_apply.setProperty("class", "primary")
+        self.btn_quick = QPushButton("一键默认流程")
+        self.btn_undo = QPushButton("撤销")
+        self.btn_reset = QPushButton("重置原始")
+        action_layout.addWidget(self.btn_import)
+        action_layout.addWidget(self.btn_apply)
+        action_layout.addWidget(self.btn_quick)
+        row = QWidget()
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(0, 0, 0, 0)
+        row_l.addWidget(self.btn_undo)
+        row_l.addWidget(self.btn_reset)
+        action_layout.addWidget(row)
+        left_layout.addWidget(action_box)
+
+        # ----- Method selection -----
+        method_box = QGroupBox("🧪 方法")
+        method_layout = QVBoxLayout(method_box)
+        self.method_combo = QComboBox()
+        self.method_keys = list(PROCESSING_METHODS.keys())
+        self.method_combo.addItems([PROCESSING_METHODS[k]["name"] for k in self.method_keys])
+        method_layout.addWidget(self.method_combo)
+        self.param_container = QWidget()
+        self.param_layout = QFormLayout(self.param_container)
+        self.param_layout.setContentsMargins(4, 4, 4, 4)
+        method_layout.addWidget(self.param_container)
+        left_layout.addWidget(method_box)
+
+        # ----- Batch -----
+        batch_box = QGroupBox("📊 批处理 / 报告")
+        batch_layout = QVBoxLayout(batch_box)
+        self.batch_list = QListWidget()
+        self.batch_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        for key in self.method_keys:
+            self.batch_list.addItem(QListWidgetItem(PROCESSING_METHODS[key]["name"]))
+        batch_layout.addWidget(self.batch_list)
+        self.btn_batch = QPushButton("运行批处理对比")
+        batch_layout.addWidget(self.btn_batch)
+        self.btn_report = QPushButton("生成报告")
+        batch_layout.addWidget(self.btn_report)
+        left_layout.addWidget(batch_box)
+
+        # ----- Display -----
+        display_box = QGroupBox("🎛 显示")
+        display_box.setCheckable(True)
+        display_box.setChecked(True)
+        display_layout = QVBoxLayout(display_box)
+        display_body = QWidget()
+        display_body_layout = QVBoxLayout(display_body)
+        display_body_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.symmetric_var = QCheckBox("对称灰度拉伸（vmin/vmax）")
+        display_body_layout.addWidget(self.symmetric_var)
+
+        self.chatgpt_style_var = QCheckBox("自动对比度（裁剪99%）")
+        self.chatgpt_style_var.setChecked(False)
+        display_body_layout.addWidget(self.chatgpt_style_var)
+
+        cmap_row = QWidget()
+        cmap_l = QHBoxLayout(cmap_row)
+        cmap_l.setContentsMargins(0, 0, 0, 0)
+        cmap_l.addWidget(QLabel("色图"))
+        self.cmap_combo = QComboBox()
+        self.cmap_combo.addItems(["gray", "viridis", "plasma", "inferno", "magma", "jet", "seismic"])
+        self.cmap_combo.setCurrentText("gray")
+        cmap_l.addWidget(self.cmap_combo)
+        display_body_layout.addWidget(cmap_row)
+
+        self.cmap_invert_var = QCheckBox("反转色图")
+        self.show_cbar_var = QCheckBox("显示色标")
+        self.show_grid_var = QCheckBox("显示网格")
+        display_body_layout.addWidget(self.cmap_invert_var)
+        display_body_layout.addWidget(self.show_cbar_var)
+        display_body_layout.addWidget(self.show_grid_var)
+
+        display_layout.addWidget(display_body)
+        display_box.toggled.connect(display_body.setVisible)
+        left_layout.addWidget(display_box)
+
+        # ----- 对比度 -----
+        contrast_box = QGroupBox("对比度")
+        contrast_layout = QVBoxLayout(contrast_box)
+        self.percentile_var = QCheckBox("百分位拉伸")
+        contrast_layout.addWidget(self.percentile_var)
+        perc_row = QWidget()
+        perc_l = QHBoxLayout(perc_row)
+        perc_l.setContentsMargins(0, 0, 0, 0)
+        perc_l.addWidget(QLabel("低"))
+        self.p_low_edit = QLineEdit("1")
+        self.p_low_edit.setFixedWidth(60)
+        perc_l.addWidget(self.p_low_edit)
+        perc_l.addWidget(QLabel("高"))
+        self.p_high_edit = QLineEdit("99")
+        self.p_high_edit.setFixedWidth(60)
+        perc_l.addWidget(self.p_high_edit)
+        contrast_layout.addWidget(perc_row)
+        left_layout.addWidget(contrast_box)
+
+        # ----- 预处理 -----
+        preprocess_box = QGroupBox("🧹 预处理")
+        preprocess_box.setCheckable(True)
+        preprocess_box.setChecked(True)
+        preprocess_layout = QVBoxLayout(preprocess_box)
+        preprocess_body = QWidget()
+        preprocess_body_layout = QVBoxLayout(preprocess_body)
+        preprocess_body_layout.setContentsMargins(4, 4, 4, 4)
+        self.normalize_var = QCheckBox("归一化（最大绝对值）")
+        self.demean_var = QCheckBox("去均值（逐道）")
+        preprocess_body_layout.addWidget(self.normalize_var)
+        preprocess_body_layout.addWidget(self.demean_var)
+        preprocess_layout.addWidget(preprocess_body)
+        preprocess_box.toggled.connect(preprocess_body.setVisible)
+        left_layout.addWidget(preprocess_box)
+
+        # ----- Crop -----
+        crop_box = QGroupBox("✂️ 裁剪")
+        crop_box.setCheckable(True)
+        crop_box.setChecked(True)
+        crop_layout = QVBoxLayout(crop_box)
+        crop_body = QWidget()
+        crop_body_layout = QVBoxLayout(crop_body)
+        crop_body_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.crop_enable_var = QCheckBox("启用裁剪")
+        crop_body_layout.addWidget(self.crop_enable_var)
+        self.time_start_edit = QLineEdit()
+        self.time_end_edit = QLineEdit()
+        self.dist_start_edit = QLineEdit()
+        self.dist_end_edit = QLineEdit()
+        crop_body_layout.addLayout(self._pair_row("时间起", self.time_start_edit, "止", self.time_end_edit))
+        crop_body_layout.addLayout(self._pair_row("距离起", self.dist_start_edit, "止", self.dist_end_edit))
+        self.btn_apply_crop = QPushButton("应用裁剪")
+        self.btn_reset_crop = QPushButton("重置裁剪")
+        crop_body_layout.addWidget(self.btn_apply_crop)
+        crop_body_layout.addWidget(self.btn_reset_crop)
+
+        crop_layout.addWidget(crop_body)
+        crop_box.toggled.connect(crop_body.setVisible)
+        left_layout.addWidget(crop_box)
+
+        # ----- Fast preview -----
+        preview_box = QGroupBox("快速预览")
+        preview_layout = QVBoxLayout(preview_box)
+        self.fast_preview_var = QCheckBox("启用分块预览")
+        preview_layout.addWidget(self.fast_preview_var)
+        self.max_samples_edit = QLineEdit("512")
+        self.max_traces_edit = QLineEdit("200")
+        preview_layout.addLayout(self._single_row("最大采样点", self.max_samples_edit))
+        preview_layout.addLayout(self._single_row("最大道数", self.max_traces_edit))
+        left_layout.addWidget(preview_box)
+
+        # ----- Downsample -----
+        down_box = QGroupBox("显示降采样")
+        down_layout = QVBoxLayout(down_box)
+        self.display_downsample_var = QCheckBox("启用显示降采样")
+        self.display_downsample_var.setChecked(True)
+        down_layout.addWidget(self.display_downsample_var)
+        self.display_max_samples_edit = QLineEdit("800")
+        self.display_max_traces_edit = QLineEdit("400")
+        down_layout.addLayout(self._single_row("最大采样点", self.display_max_samples_edit))
+        down_layout.addLayout(self._single_row("最大道数", self.display_max_traces_edit))
+        left_layout.addWidget(down_box)
+
+        # ----- Info -----
+        info_box = QGroupBox("ℹ️ 信息 / 记录")
+        info_layout = QVBoxLayout(info_box)
+        self.info = QTextEdit()
+        self.info.setReadOnly(True)
+        info_layout.addWidget(self.info)
+        left_layout.addWidget(info_box)
+        left_layout.addStretch(1)
+
+        # ----- Plot -----
+        status_bar = QWidget()
+        status_layout = QHBoxLayout(status_bar)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        self.status_label = QLabel("未加载文件")
+        self.status_label.setStyleSheet("color:#718096;")
+        status_layout.addWidget(self.status_label)
+        status_layout.addStretch(1)
+        right_layout.addWidget(status_bar)
+
+        self.fig = Figure(figsize=(7, 5), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("B-扫")
+        self.ax.set_xlabel("距离（道索引）")
+        self.ax.set_ylabel("时间（采样索引）")
+        self.canvas = FigureCanvas(self.fig)
+        right_layout.addWidget(self.canvas)
+
+        # ---- Signals ----
+        self.btn_import.clicked.connect(self.load_csv)
+        self.btn_apply.clicked.connect(self.apply_method)
+        self.btn_quick.clicked.connect(self.run_default_pipeline)
+        self.btn_undo.clicked.connect(self.undo_last)
+        self.btn_reset.clicked.connect(self.reset_original)
+        self.btn_batch.clicked.connect(self.run_batch)
+        self.btn_report.clicked.connect(self.generate_report)
+        self.btn_apply_crop.clicked.connect(self._refresh_plot)
+        self.btn_reset_crop.clicked.connect(self._reset_crop)
+
+        self.method_combo.currentIndexChanged.connect(self._on_method_change)
+        self.cmap_combo.currentIndexChanged.connect(self._refresh_plot)
+
+        for cb in [
+            self.symmetric_var, self.chatgpt_style_var, self.cmap_invert_var, self.show_cbar_var, self.show_grid_var,
+            self.percentile_var, self.normalize_var, self.demean_var,
+            self.crop_enable_var, self.display_downsample_var,
+        ]:
+            cb.stateChanged.connect(self._refresh_plot)
+
+        self._render_params(self.method_keys[0])
+        self._log("Welcome. Please import a CSV to view B-扫.")
+
+    # --------- UI helpers ---------
+    def _pair_row(self, label1, edit1, label2, edit2):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel(label1))
+        edit1.setFixedWidth(80)
+        row.addWidget(edit1)
+        row.addWidget(QLabel(label2))
+        edit2.setFixedWidth(80)
+        row.addWidget(edit2)
+        row.addStretch(1)
+        return row
+
+    def _single_row(self, label, edit):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel(label))
+        edit.setFixedWidth(80)
+        row.addWidget(edit)
+        row.addStretch(1)
+        return row
+
+    # --------- Logging ---------
+    def _apply_style(self):
+        # Minimal, clean UI theme
+        self.setStyleSheet(
+            """
+            QMainWindow { background: #F5F7FA; font-size: 13px; font-family: "Noto Sans CJK SC"; }
+            QGroupBox {
+                background: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding: 8px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #2D3748;
+            }
+            QLabel { color: #4A5568; }
+            QPushButton {
+                background: #EDF2F7;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 6px 10px;
+                color: #2D3748;
+                min-height: 26px;
+            }
+            QPushButton:hover { background: #E6EEF8; }
+            QPushButton:pressed { background: #DCE7F5; }
+            QPushButton[class="primary"] {
+                background: #2F6FED;
+                color: #FFFFFF;
+                border: 1px solid #2F6FED;
+            }
+            QPushButton[class="primary"]:hover { background: #2A63D6; }
+            QComboBox, QLineEdit {
+                background: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 6px;
+                padding: 4px 6px;
+                min-height: 24px;
+            }
+            QCheckBox { color: #4A5568; }
+            QScrollArea { border: none; }
+            QTextEdit {
+                background: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            """
+        )
+
+    def _log(self, msg: str):
+        self.info.append(msg)
+        self.info.ensureCursorVisible()
+
+    def _clip_for_display(self, data: np.ndarray, clip_percent: float = 99.0):
+        x = data.astype(np.float64)
+        v = np.percentile(np.abs(x), clip_percent)
+        v = max(v, 1e-12)
+        return np.clip(x, -v, v), v
+
+    # --------- History ---------
+    def _push_history(self):
+        if self.data is None:
+            return
+        self.history.append(self.data.copy())
+        if len(self.history) > 10:
+            self.history.pop(0)
+
+    def undo_last(self):
+        if not self.history:
+            QMessageBox.information(self, "撤销", "无可恢复的历史状态。")
+            return
+        self.data = self.history.pop()
+        self.plot_data(self.data)
+        self._log("撤销: restored previous state.")
+
+    def reset_original(self):
+        if self.original_data is None:
+            QMessageBox.information(self, "重置", "未加载原始数据。")
+            return
+        self._push_history()
+        self.data = self.original_data.copy()
+        self.plot_data(self.data)
+        self._log("重置: restored original data.")
+
+    # --------- UI callbacks ---------
+    def _on_method_change(self, idx=None):
+        idx = self.method_combo.currentIndex()
+        key = self.method_keys[idx]
+        self._render_params(key)
+
+    def _refresh_plot(self):
+        if self.data is not None:
+            self.plot_data(self.data)
+
+    def _reset_crop(self):
+        self.time_start_edit.setText("")
+        self.time_end_edit.setText("")
+        self.dist_start_edit.setText("")
+        self.dist_end_edit.setText("")
+        self.crop_enable_var.setChecked(False)
+        self._refresh_plot()
+
+    # --------- Data helpers ---------
+    def _parse_float(self, text: str):
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    def _get_colormap(self):
+        cmap = (self.cmap_combo.currentText() or "gray").strip()
+        if self.cmap_invert_var.isChecked():
+            if cmap.endswith("_r"):
+                cmap = cmap[:-2]
+            else:
+                cmap = cmap + "_r"
+        return cmap
+
+    def _get_percentile_bounds(self, data: np.ndarray):
+        if not self.percentile_var.isChecked():
+            return None
+        try:
+            low = float(self.p_low_edit.text() or 1.0)
+            high = float(self.p_high_edit.text() or 99.0)
+        except Exception:
+            return None
+        low = max(0.0, min(100.0, low))
+        high = max(0.0, min(100.0, high))
+        if high <= low:
+            return None
+        vmin, vmax = np.percentile(data, [low, high])
+        if vmin == vmax:
+            return None
+        return vmin, vmax
+
+    def _apply_preprocess(self, data: np.ndarray) -> np.ndarray:
+        out = data
+        if self.demean_var.isChecked():
+            mean = np.mean(out, axis=0, keepdims=True)
+            out = out - mean
+        if self.normalize_var.isChecked():
+            maxv = np.max(np.abs(out))
+            if maxv == 0:
+                maxv = 1e-6
+            out = out / maxv
+        return out
+
+    def _get_crop_bounds(self, data: np.ndarray):
+        if not self.crop_enable_var.isChecked():
+            return None
+
+        n_time, n_dist = data.shape
+        time_start = self._parse_float(self.time_start_edit.text().strip())
+        time_end = self._parse_float(self.time_end_edit.text().strip())
+        dist_start = self._parse_float(self.dist_start_edit.text().strip())
+        dist_end = self._parse_float(self.dist_end_edit.text().strip())
+
+        if self.header_info:
+            total_time = float(self.header_info.get("total_time_ns", n_time))
+            num_traces = max(1, int(self.header_info.get("num_traces", n_dist)))
+            trace_interval = float(self.header_info.get("trace_interval_m", 1.0))
+            dist_total = trace_interval * (num_traces - 1)
+
+            if time_start is None:
+                time_start = 0.0
+            if time_end is None:
+                time_end = total_time
+            if dist_start is None:
+                dist_start = 0.0
+            if dist_end is None:
+                dist_end = dist_total
+
+            time_start = max(0.0, min(total_time, time_start))
+            time_end = max(0.0, min(total_time, time_end))
+            dist_start = max(0.0, min(dist_total, dist_start))
+            dist_end = max(0.0, min(dist_total, dist_end))
+
+            if time_end < time_start:
+                time_start, time_end = time_end, time_start
+            if dist_end < dist_start:
+                dist_start, dist_end = dist_end, dist_start
+
+            def time_to_idx(t):
+                if total_time <= 0 or n_time <= 1:
+                    return 0
+                return int(round(t / total_time * (n_time - 1)))
+
+            def dist_to_idx(d):
+                if dist_total <= 0 or n_dist <= 1:
+                    return 0
+                return int(round(d / dist_total * (n_dist - 1)))
+
+            t0 = max(0, min(n_time - 1, time_to_idx(time_start)))
+            t1 = max(0, min(n_time - 1, time_to_idx(time_end)))
+            d0 = max(0, min(n_dist - 1, dist_to_idx(dist_start)))
+            d1 = max(0, min(n_dist - 1, dist_to_idx(dist_end)))
+        else:
+            if time_start is None:
+                time_start = 0.0
+            if time_end is None:
+                time_end = float(n_time - 1)
+            if dist_start is None:
+                dist_start = 0.0
+            if dist_end is None:
+                dist_end = float(n_dist - 1)
+
+            time_start = max(0.0, min(n_time - 1, time_start))
+            time_end = max(0.0, min(n_time - 1, time_end))
+            dist_start = max(0.0, min(n_dist - 1, dist_start))
+            dist_end = max(0.0, min(n_dist - 1, dist_end))
+
+            if time_end < time_start:
+                time_start, time_end = time_end, time_start
+            if dist_end < dist_start:
+                dist_start, dist_end = dist_end, dist_start
+
+            t0 = int(round(time_start))
+            t1 = int(round(time_end))
+            d0 = int(round(dist_start))
+            d1 = int(round(dist_end))
+
+        return {
+            "t0": t0,
+            "t1": t1,
+            "d0": d0,
+            "d1": d1,
+            "time_start": time_start,
+            "time_end": time_end,
+            "dist_start": dist_start,
+            "dist_end": dist_end,
+        }
+
+    def _apply_crop(self, data: np.ndarray):
+        bounds = self._get_crop_bounds(data)
+        if not bounds:
+            return data, None
+        t0, t1, d0, d1 = bounds["t0"], bounds["t1"], bounds["d0"], bounds["d1"]
+        cropped = data[t0:t1 + 1, d0:d1 + 1]
+        return cropped, bounds
+
+    def _downsample_data(self, data: np.ndarray) -> np.ndarray:
+        if not self.fast_preview_var.isChecked():
+            return data
+        try:
+            max_samples = int(float(self.max_samples_edit.text() or 0))
+            max_traces = int(float(self.max_traces_edit.text() or 0))
+        except Exception:
+            return data
+        n_time, n_dist = data.shape
+        if max_samples > 0 and n_time > max_samples:
+            idx = np.linspace(0, n_time - 1, max_samples).astype(int)
+            data = data[idx, :]
+        if max_traces > 0 and n_dist > max_traces:
+            idx = np.linspace(0, n_dist - 1, max_traces).astype(int)
+            data = data[:, idx]
+        return data
+
+    def _downsample_for_display(self, data: np.ndarray) -> np.ndarray:
+        if not self.display_downsample_var.isChecked():
+            return data
+        try:
+            max_samples = int(float(self.display_max_samples_edit.text() or 0))
+            max_traces = int(float(self.display_max_traces_edit.text() or 0))
+        except Exception:
+            return data
+        n_time, n_dist = data.shape
+        if max_samples > 0 and n_time > max_samples:
+            idx = np.linspace(0, n_time - 1, max_samples).astype(int)
+            data = data[idx, :]
+        if max_traces > 0 and n_dist > max_traces:
+            idx = np.linspace(0, n_dist - 1, max_traces).astype(int)
+            data = data[:, idx]
+        return data
+
+    # --------- Params rendering ---------
+    def _render_params(self, method_key: str):
+        while self.param_layout.rowCount():
+            self.param_layout.removeRow(0)
+        self.param_vars = {}
+        params = PROCESSING_METHODS[method_key].get("params", [])
+        if not params:
+            self.param_layout.addRow(QLabel("(No parameters)"))
+            return
+        for p in params:
+            edit = QLineEdit(str(p.get("default", "")))
+            edit.setFixedWidth(120)
+            self.param_layout.addRow(QLabel(p["label"]), edit)
+            self.param_vars[p["name"]] = (edit, p)
+
+    def _get_params(self):
+        params = {}
+        for name, (edit, meta) in self.param_vars.items():
+            raw = edit.text().strip()
+            if raw == "":
+                raw = str(meta.get("default", ""))
+            try:
+                if meta["type"] == "int":
+                    val = int(float(raw))
+                elif meta["type"] == "float":
+                    val = float(raw)
+                else:
+                    val = raw
+            except Value错误:
+                raise Value错误(f"Invalid value for {meta['label']}")
+            params[name] = val
+        return params
+
+    # --------- Data I/O ---------
+    def load_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 CSV", "", "CSV 文件 (*.csv);;所有文件 (*)")
+        if not path:
+            return
+
+        try:
+            header_info = detect_csv_header(path)
+
+            skip_lines = _detect_skiprows(path)
+
+            if self.fast_preview_var.isChecked():
+                try:
+                    max_samples = int(float(self.max_samples_edit.text() or 0))
+                    max_traces = int(float(self.max_traces_edit.text() or 0))
+                except Exception:
+                    max_samples, max_traces = 0, 0
+                target_rows = max_samples if max_samples > 0 else 200000
+                if header_info and max_samples > 0 and max_traces > 0:
+                    target_rows = max_samples * max_traces
+                rows = []
+                count = 0
+                for chunk in pd.read_csv(path, header=None, skiprows=skip_lines, chunksize=200000):
+                    rows.append(chunk)
+                    count += len(chunk)
+                    if count >= target_rows:
+                        break
+                df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+            else:
+                df = pd.read_csv(path, header=None, skiprows=skip_lines)
+            raw_data = df.values
+
+            if header_info:
+                samples = header_info["a_scan_length"]
+                traces = header_info["num_traces"]
+
+                if raw_data.shape[1] <= 10 and raw_data.shape[0] >= samples * traces:
+                    col_idx = _select_amp_column(raw_data)
+                    signal_1d = raw_data[:, col_idx]
+                    data = signal_1d[:traces * samples].reshape((traces, samples)).T
+                elif raw_data.shape[0] == traces and raw_data.shape[1] >= samples:
+                    data = raw_data[:, :samples].T
+                elif raw_data.shape[0] >= samples and raw_data.shape[1] >= traces:
+                    data = raw_data[:samples, :traces]
+                else:
+                    data = raw_data
+            else:
+                data = raw_data
+
+            if self.fast_preview_var.isChecked():
+                data = self._downsample_data(data)
+                self._log("快速预览：数据已降采样。")
+
+            if np.isnan(data).any():
+                data = np.nan_to_num(data, nan=np.nanmean(data))
+
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+
+            self.data = data
+            self.data_path = path
+            self.header_info = header_info
+            self.original_data = data.copy()
+            self.history = []
+
+            self._log(f"已加载 CSV： {path}  shape={data.shape}")
+            if header_info:
+                self.status_label.setText(
+                    f"{os.path.basename(path)} | 采样:{header_info['a_scan_length']} 道数:{header_info['num_traces']}"
+                )
+            else:
+                self.status_label.setText(os.path.basename(path))
+            if header_info:
+                self._log(
+                    "检测到头信息： "
+                    f"A-scan length={header_info['a_scan_length']} samples; "
+                    f"Total time={header_info['total_time_ns']} ns; "
+                    f"A-scan count={header_info['num_traces']}; "
+                    f"Trace interval={header_info['trace_interval_m']} m"
+                )
+            else:
+                self._log("未检测到头信息；使用索引坐标。")
+
+            self.plot_data(data)
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载 CSV 失败： {e}")
+            self._log(f"加载 CSV 失败： {e}")
+
+    # --------- Plot ---------
+    def plot_data(self, data: np.ndarray):
+        self.ax.clear()
+        extent = None
+        if self.header_info:
+            num_traces = max(1, int(self.header_info.get("num_traces", data.shape[1])))
+            trace_interval = float(self.header_info.get("trace_interval_m", 1.0))
+            total_time = float(self.header_info.get("total_time_ns", data.shape[0]))
+            distance_end = trace_interval * (num_traces - 1)
+            extent = [0.0, distance_end, total_time, 0.0]
+            self.ax.set_xlabel("距离 (m)")
+            self.ax.set_ylabel("时间 (ns)")
+        else:
+            self.ax.set_xlabel("距离（道索引）")
+            self.ax.set_ylabel("时间（采样索引）")
+
+        valid_data = np.nan_to_num(data)
+        valid_data = self._apply_preprocess(valid_data)
+        valid_data, bounds = self._apply_crop(valid_data)
+        display_data = self._downsample_for_display(valid_data)
+
+        if self.header_info:
+            total_time = float(self.header_info.get("total_time_ns", valid_data.shape[0]))
+            num_traces = max(1, int(self.header_info.get("num_traces", valid_data.shape[1])))
+            trace_interval = float(self.header_info.get("trace_interval_m", 1.0))
+            distance_end = trace_interval * (num_traces - 1)
+            time_start = 0.0
+            time_end = total_time
+            dist_start = 0.0
+            dist_end = distance_end
+            if bounds:
+                time_start = bounds["time_start"]
+                time_end = bounds["time_end"]
+                dist_start = bounds["dist_start"]
+                dist_end = bounds["dist_end"]
+            extent = [dist_start, dist_end, time_end, time_start]
+        else:
+            if bounds:
+                extent = [bounds["dist_start"], bounds["dist_end"], bounds["time_end"], bounds["time_start"]]
+            else:
+                extent = None
+
+        cmap = self._get_colormap()
+
+        if self.cbar is not None:
+            try:
+                self.cbar.remove()
+            except Exception:
+                pass
+            self.cbar = None
+
+        if self.chatgpt_style_var.isChecked():
+            clipped, v = self._clip_for_display(display_data, clip_percent=99.0)
+            im = self.ax.imshow(
+                clipped,
+                cmap=cmap,
+                aspect="auto",
+                extent=extent,
+                vmin=-v,
+                vmax=v,
+                interpolation="nearest",
+                origin="upper",
+            )
+            self.ax.set_title(f"B-扫 (clip=±{v:.3g})")
+        else:
+            if self.symmetric_var.isChecked():
+                stdcont = np.nanmax(np.abs(display_data))
+                if stdcont == 0:
+                    stdcont = 1e-6
+                vmin = -stdcont
+                vmax = stdcont
+                im = self.ax.imshow(
+                    display_data,
+                    cmap=cmap,
+                    aspect="auto",
+                    extent=extent,
+                    vmin=vmin,
+                    vmax=vmax,
+                    interpolation="nearest",
+                )
+            else:
+                perc_bounds = self._get_percentile_bounds(display_data)
+                if perc_bounds:
+                    vmin, vmax = perc_bounds
+                    im = self.ax.imshow(
+                        display_data,
+                        cmap=cmap,
+                        aspect="auto",
+                        extent=extent,
+                        vmin=vmin,
+                        vmax=vmax,
+                        interpolation="nearest",
+                    )
+                else:
+                    im = self.ax.imshow(display_data, cmap=cmap, aspect="auto", extent=extent, interpolation="nearest")
+
+        if self.show_cbar_var.isChecked() and not self.chatgpt_style_var.isChecked():
+            self.cbar = self.fig.colorbar(im, ax=self.ax, fraction=0.046, pad=0.04)
+        self.ax.grid(self.show_grid_var.isChecked(), color="#D7DEE5", alpha=0.4)
+        if not self.chatgpt_style_var.isChecked():
+            self.ax.set_title("B-扫")
+        self.canvas.draw()
+
+    # --------- Save outputs ---------
+    def _save_outputs(self, data: np.ndarray, method_key: str):
+        out_dir = os.path.join(BASE_DIR, "output")
+        os.makedirs(out_dir, exist_ok=True)
+        out_csv = os.path.join(out_dir, f"{method_key}_out.csv")
+        out_png = os.path.join(out_dir, f"{method_key}_out.png")
+
+        save_data = self._apply_preprocess(np.nan_to_num(data))
+        save_data, bounds = self._apply_crop(save_data)
+        savecsv(save_data, out_csv)
+
+        time_range = None
+        distance_range = None
+        if self.header_info:
+            total_time = float(self.header_info["total_time_ns"])
+            num_traces = max(1, int(self.header_info["num_traces"]))
+            trace_interval = float(self.header_info["trace_interval_m"])
+            distance_end = trace_interval * (num_traces - 1)
+            if bounds:
+                time_range = (bounds["time_start"], bounds["time_end"])
+                distance_range = (bounds["dist_start"], bounds["dist_end"])
+            else:
+                time_range = (0.0, total_time)
+                distance_range = (0.0, distance_end)
+
+        save_image(
+            save_data,
+            out_png,
+            title=method_key,
+            time_range=time_range,
+            distance_range=distance_range,
+            cmap=self._get_colormap(),
+        )
+        return out_csv, out_png
+
+    # --------- Batch ---------
+    def run_batch(self):
+        if self.data is None or self.data_path is None:
+            QMessageBox.warning(self, "No data", "Please import a CSV first.")
+            return
+        selected = [i.row() for i in self.batch_list.selectedIndexes()]
+        if not selected:
+            QMessageBox.warning(self, "No selection", "Please select methods for batch processing.")
+            return
+
+        self._push_history()
+        base_data = self.data
+        last_data = None
+        for idx in selected:
+            method_key = self.method_keys[idx]
+            method = PROCESSING_METHODS[method_key]
+            self._log(f"Batch: {method['name']}")
+
+            params = {}
+            for p in method.get("params", []):
+                params[p["name"]] = p.get("default")
+
+            try:
+                if method["type"] == "core":
+                    mod = __import__(method["module"])
+                    func = getattr(mod, method["func"])
+                    length_trace = base_data.shape[0]
+                    start_position = 0
+                    end_position = base_data.shape[1]
+                    scans_per_meter = 1
+
+                    temp_in_csv = os.path.join(BASE_DIR, "output", "temp_in.csv")
+                    savecsv(base_data, temp_in_csv)
+
+                    out_dir = os.path.join(BASE_DIR, "output")
+                    os.makedirs(out_dir, exist_ok=True)
+                    out_csv = os.path.join(out_dir, f"{method_key}_out.csv")
+                    out_png = os.path.join(out_dir, f"{method_key}_out.png")
+
+                    if method_key == "compensatingGain":
+                        gain_min = float(params.get("gain_min", 1.0))
+                        gain_max = float(params.get("gain_max", 6.0))
+                        gain_func = np.linspace(gain_min, gain_max, base_data.shape[0]).tolist()
+                        func(temp_in_csv, out_csv, out_png, length_trace, start_position, end_position, gain_func)
+                    elif method_key == "dewow":
+                        window = int(params.get("window", max(1, length_trace // 4)))
+                        func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter, window)
+                    elif method_key == "set_zero_time":
+                        new_zero_time = float(params.get("new_zero_time", 5.0))
+                        func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter, new_zero_time)
+                    elif method_key == "agcGain":
+                        window = int(params.get("window", max(1, length_trace // 4)))
+                        func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter, window)
+                    elif method_key == "subtracting_average_2D":
+                        func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter)
+                    elif method_key == "running_average_2D":
+                        func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter)
+                    else:
+                        self._log("Unknown core method; skipped.")
+                        continue
+
+                    if os.path.exists(out_csv):
+                        newdata_df = pd.read_csv(out_csv, header=None)
+                        newdata = newdata_df.values
+                        if newdata.ndim == 1:
+                            newdata = newdata.reshape(-1, 1)
+                        last_data = newdata
+                        self._save_outputs(newdata, method_key)
+                        self._log(f"Batch saved: {out_csv}")
+                else:
+                    result = method["func"](base_data, **params)
+                    newdata = result[0] if isinstance(result, tuple) else result
+                    last_data = newdata
+                    out_csv, _ = self._save_outputs(newdata, method_key)
+                    self._log(f"Batch saved: {out_csv}")
+            except Exception as e:
+                self._log(f"Batch error ({method_key}): {e}")
+
+        if last_data is not None:
+            self.data = last_data
+            self.plot_data(self.data)
+
+    # --------- Report ---------
+    def generate_report(self):
+        if self.data is None or self.data_path is None:
+            QMessageBox.warning(self, "No data", "Please import a CSV first.")
+            return
+        out_dir = os.path.join(BASE_DIR, "output")
+        os.makedirs(out_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(out_dir, f"report_{ts}.md")
+        image_path = os.path.join(out_dir, f"report_{ts}.png")
+
+        try:
+            self.fig.savefig(image_path, dpi=150)
+        except Exception as e:
+            self._log(f"Report screenshot failed: {e}")
+
+        bounds = None
+        try:
+            bounds = self._get_crop_bounds(self._apply_preprocess(np.nan_to_num(self.data)))
+        except Exception:
+            bounds = None
+
+        method_key = self.method_keys[self.method_combo.currentIndex()]
+        method_name = PROCESSING_METHODS[method_key]["name"]
+        try:
+            params = self._get_params()
+        except Exception:
+            params = {}
+
+        lines = []
+        lines.append(f"# GPR GUI Report ({ts})")
+        lines.append("")
+        lines.append(f"- Data file: {self.data_path}")
+        lines.append(f"- Method: {method_name}")
+        if params:
+            lines.append(f"- Params: {params}")
+        lines.append(f"- 色图: {self._get_colormap()}")
+        lines.append(f"- 显示色标: {self.show_cbar_var.isChecked()}")
+        lines.append(f"- 显示网格: {self.show_grid_var.isChecked()}")
+        lines.append(f"- Symmetric stretch: {self.symmetric_var.isChecked()}")
+        if self.percentile_var.isChecked():
+            lines.append(
+                f"- 百分位拉伸: {self.percentile_var.isChecked()} (low={self.p_low_edit.text()}, high={self.p_high_edit.text()})"
+            )
+        else:
+            lines.append(f"- 百分位拉伸: {self.percentile_var.isChecked()}")
+        lines.append(f"- Normalize: {self.normalize_var.isChecked()}")
+        lines.append(f"- Demean: {self.demean_var.isChecked()}")
+        lines.append(
+            f"- Display downsample: {self.display_downsample_var.isChecked()} (max_samples={self.display_max_samples_edit.text()}, max_traces={self.display_max_traces_edit.text()})"
+        )
+        if bounds:
+            lines.append(
+                f"- Crop: time {bounds['time_start']}~{bounds['time_end']} ; distance {bounds['dist_start']}~{bounds['dist_end']}"
+            )
+        else:
+            lines.append("- Crop: disabled")
+        lines.append("")
+        lines.append(f"- Screenshot: {image_path}")
+        lines.append("")
+        lines.append("## Log")
+        log_text = self.info.toPlainText().strip()
+        lines.append("```")
+        lines.append(log_text)
+        lines.append("```")
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        self._log(f"Report saved: {report_path}")
+
+    def run_default_pipeline(self):
+        if self.data is None or self.data_path is None:
+            QMessageBox.warning(self, "无数据", "请先导入 CSV。")
+            return
+        self._log("运行默认流程：背景抑制 → AGC")
+        order = ["subtracting_average_2D", "agcGain"]
+        current_idx = self.method_combo.currentIndex()
+        for key in order:
+            if key in self.method_keys:
+                self.method_combo.setCurrentIndex(self.method_keys.index(key))
+                self.apply_method()
+        self.method_combo.setCurrentIndex(current_idx)
+
+    # --------- Apply ---------
+    def apply_method(self):
+        if self.data is None or self.data_path is None:
+            QMessageBox.warning(self, "No data", "Please import a CSV first.")
+            return
+        idx = self.method_combo.currentIndex()
+        method_key = self.method_keys[idx]
+        method = PROCESSING_METHODS[method_key]
+        self._log(f"Applying: {method['name']}")
+        self._push_history()
+
+        try:
+            params = self._get_params()
+        except ValueError as e:
+            QMessageBox.critical(self, "Invalid parameter", str(e))
+            return
+
+        out_dir = os.path.join(BASE_DIR, "output")
+        os.makedirs(out_dir, exist_ok=True)
+        out_csv = os.path.join(out_dir, f"{method_key}_out.csv")
+        out_png = os.path.join(out_dir, f"{method_key}_out.png")
+
+        try:
+            if method["type"] == "core":
+                mod = __import__(method["module"])
+                func = getattr(mod, method["func"])
+                length_trace = self.data.shape[0]
+                start_position = 0
+                end_position = self.data.shape[1]
+                scans_per_meter = 1
+
+                temp_in_csv = os.path.join(out_dir, "temp_in.csv")
+                savecsv(self.data, temp_in_csv)
+
+                if method_key == "compensatingGain":
+                    gain_min = float(params.get("gain_min", 1.0))
+                    gain_max = float(params.get("gain_max", 6.0))
+                    gain_func = np.linspace(gain_min, gain_max, self.data.shape[0]).tolist()
+                    func(temp_in_csv, out_csv, out_png, length_trace, start_position, end_position, gain_func)
+                elif method_key == "dewow":
+                    window = int(params.get("window", max(1, length_trace // 4)))
+                    func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter, window)
+                elif method_key == "set_zero_time":
+                    new_zero_time = float(params.get("new_zero_time", 5.0))
+                    func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter, new_zero_time)
+                elif method_key == "agcGain":
+                    window = int(params.get("window", max(1, length_trace // 4)))
+                    func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter, window)
+                elif method_key == "subtracting_average_2D":
+                    func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter)
+                elif method_key == "running_average_2D":
+                    func(temp_in_csv, out_csv, out_png, length_trace, start_position, scans_per_meter)
+                else:
+                    self._log("Unknown core method; no processing applied.")
+                    self.plot_data(self.data)
+                    return
+
+                if os.path.exists(out_csv):
+                    newdata_df = pd.read_csv(out_csv, header=None)
+                    newdata = newdata_df.values
+                    if newdata.ndim == 1:
+                        newdata = newdata.reshape(-1, 1)
+                    self.data = newdata
+                    out_csv, out_png = self._save_outputs(newdata, method_key)
+                    self.plot_data(newdata)
+                    self._log(f"Processed data saved: {out_csv}")
+                else:
+                    self._log("Processing finished but output CSV not found.")
+            else:
+                result = method["func"](self.data, **params)
+                if isinstance(result, tuple):
+                    newdata = result[0]
+                else:
+                    newdata = result
+                self.data = newdata
+                self.plot_data(newdata)
+                out_csv, out_png = self._save_outputs(newdata, method_key)
+                self._log(f"Processed data saved: {out_csv}")
+        except Exception as e:
+            self._log(f"Processing error: {e}")
+            QMessageBox.critical(self, "错误", f"Processing error: {e}")
+
+
+def apply_theme(app: QApplication):
+    """Try qt-material, then qdarkstyle. Returns theme name."""
+    try:
+        from qt_material import apply_stylesheet
+        apply_stylesheet(app, theme="light_blue.xml")
+        return "qt-material: light_blue.xml"
+    except Exception:
+        try:
+            import qdarkstyle
+            app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt6())
+            return "qdarkstyle"
+        except Exception:
+            return "default"
+
+
+def main():
+    app = QApplication(sys.argv)
+    theme_name = apply_theme(app)
+    win = GPRGuiQt()
+    win.statusBar().showMessage(f"Theme: {theme_name}")
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

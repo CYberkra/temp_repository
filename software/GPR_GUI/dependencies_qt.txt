@@ -1,0 +1,10 @@
+# Core
+numpy
+pandas
+matplotlib
+scipy
+
+# GUI
+PyQt6
+qt-material
+qdarkstyle
