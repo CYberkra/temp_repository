@@ -1,2 +1,0 @@
-# temp_repository
-临时文件夹用于给openclaw传输文件
