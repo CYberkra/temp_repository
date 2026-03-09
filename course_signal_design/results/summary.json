@@ -1,0 +1,59 @@
+{
+  "config": {
+    "c": 300000000.0,
+    "eps_r": 9.0,
+    "fc": 500000000.0,
+    "bw": 300000000.0,
+    "pulse_dur": 3e-08,
+    "fs": 5000000000.0,
+    "t_max": 1.8e-07,
+    "num_traces": 121,
+    "x_min": -1.2,
+    "x_max": 1.2,
+    "noise_std": 0.06,
+    "clutter_scale": 0.16
+  },
+  "targets_true": [
+    {
+      "x0": -0.35,
+      "z": 0.48,
+      "amp": 1.0
+    },
+    {
+      "x0": 0.55,
+      "z": 0.72,
+      "amp": 1.2
+    }
+  ],
+  "detected_peaks": [
+    {
+      "sample": 210,
+      "time_ns": 12.2,
+      "depth_m": 0.61,
+      "amplitude": 63.78898706064777
+    },
+    {
+      "sample": 221,
+      "time_ns": 14.4,
+      "depth_m": 0.72,
+      "amplitude": 55.38489557713247
+    },
+    {
+      "sample": 232,
+      "time_ns": 16.6,
+      "depth_m": 0.83,
+      "amplitude": 46.46730395171712
+    },
+    {
+      "sample": 244,
+      "time_ns": 19.0,
+      "depth_m": 0.9500000000000001,
+      "amplitude": 45.12047161414138
+    }
+  ],
+  "files": [
+    "results/01_tx_pulse.png",
+    "results/02_bscan_compare.png",
+    "results/03_center_trace_peaks.png"
+  ]
+}
